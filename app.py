@@ -4,6 +4,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+import duckdb
 import chess, chess.pgn, chess.engine
 
 CONTACT = os.environ.get("CONTACT_EMAIL", "contact-not-set")
@@ -131,17 +132,25 @@ if run:
 
 ORDER = ["120s+", "60-120s", "30-60s", "10-30s", "0-10s"]
 
+# Reusable SQL snippet that sorts each move into a "time left" group
+BUCKET = """CASE WHEN clock_before < 10  THEN '0-10s'
+                 WHEN clock_before < 30  THEN '10-30s'
+                 WHEN clock_before < 60  THEN '30-60s'
+                 WHEN clock_before < 120 THEN '60-120s'
+                 ELSE '120s+' END"""
+
 if "df" in st.session_state:
     df = st.session_state["df"].copy()
     username, time_class, blunder_cp = st.session_state["meta"]
-    df = df[(df["eval_before"].abs() <= 300) & (df["move_number"] > 5)]
+    df = df[(df["eval_before"].abs() <= 300) & (df["move_number"] > 5)].copy()
     if "move" not in df.columns:
         df["move"] = ""
-
-    df["Who"] = df["who"].map({"Player": username, "Opponents": "Opponents"})
-    df["TimeLeft"] = pd.cut(df["clock_before"], [-1, 10, 30, 60, 120, 100000],
-                            labels=["0-10s", "10-30s", "30-60s", "60-120s", "120s+"]).astype(str)
+    df["player"] = df["who"].map({"Player": username, "Opponents": "Opponents"})
     me = df[df["who"] == "Player"]
+
+    # In-memory SQL database: the analyzed moves become a table called "moves"
+    con = duckdb.connect()
+    con.register("moves", df)
 
     st.subheader(f"Results for {username}")
     st.caption(f"Based on {df['game_id'].nunique()} {time_class} games ({len(df):,} moves analyzed).")
@@ -150,14 +159,26 @@ if "df" in st.session_state:
 
     # ---------- 1. Short answer ----------
     st.markdown("### 1. The short answer")
-    groups = [("Plenty of time", "60+ sec left", me[me["clock_before"] >= 60]),
-              ("Getting short", "30-60 sec left", me[(me["clock_before"] >= 30) & (me["clock_before"] < 60)]),
-              ("Rushed", "under 30 sec left", me[me["clock_before"] < 30])]
+    sa = con.execute("""
+        SELECT CASE WHEN clock_before >= 60 THEN 1
+                    WHEN clock_before >= 30 THEN 2
+                    ELSE 3 END                AS grp,
+               COUNT(*)                       AS moves,
+               100.0 * AVG(is_blunder)        AS rate
+        FROM moves
+        WHERE who = 'Player'
+        GROUP BY grp
+        ORDER BY grp
+    """).df().set_index("grp")
+
+    titles = [(1, "Plenty of time", "60+ sec left"),
+              (2, "Getting short", "30-60 sec left"),
+              (3, "Rushed", "under 30 sec left")]
     rates = []
-    for col, (title, sub, d) in zip(st.columns(3), groups):
+    for col, (g, title, sub) in zip(st.columns(3), titles):
         with col:
-            if len(d) >= 30:
-                r = d["is_blunder"].mean() * 100
+            if g in sa.index and sa.loc[g, "moves"] >= 30:
+                r = float(sa.loc[g, "rate"])
                 rates.append(r)
                 st.metric(f"{title} ({sub})", f"{r:.1f}% of moves")
                 st.caption(f"about 1 in {round(100 / r)} moves is a big mistake" if r > 0
@@ -183,9 +204,16 @@ if "df" in st.session_state:
 
     # ---------- 2. Main chart ----------
     st.markdown("### 2. How mistakes change as the clock runs down")
-    cd = (df.groupby(["TimeLeft", "Who"])
-            .agg(Moves=("is_blunder", "size"), Mistakes=("is_blunder", "sum")).reset_index())
-    cd["Per100"] = (cd["Mistakes"] / cd["Moves"] * 100).round(2)
+    MAIN_QUERY = f"""
+SELECT player                                   AS Who,
+       {BUCKET}                                 AS TimeLeft,
+       COUNT(*)                                 AS Moves,
+       CAST(SUM(is_blunder) AS INTEGER)         AS Mistakes,
+       ROUND(100.0 * AVG(is_blunder), 2)        AS Per100
+FROM moves
+GROUP BY 1, 2
+"""
+    cd = con.execute(MAIN_QUERY).df()
     chart = (alt.Chart(cd).mark_line(point=True, strokeWidth=3).encode(
                 x=alt.X("TimeLeft:N", sort=ORDER, title="Time left on the clock before the move"),
                 y=alt.Y("Per100:Q", title="Big mistakes per 100 moves"),
@@ -201,18 +229,23 @@ if "df" in st.session_state:
                "The left side is lots of time, the right side is almost none. A line that climbs toward "
                "the right means more big mistakes when rushed. Hover over a dot to see how many moves it's "
                "based on, and don't trust dots built from very few moves.")
+    with st.expander("Show the SQL behind this chart"):
+        st.code(MAIN_QUERY.strip(), language="sql")
 
     # ---------- 3. Worst mistakes ----------
     st.markdown(f"### 3. {username}'s biggest mistakes")
-    worst = me[me["is_blunder"] == 1].sort_values("eval_drop", ascending=False).head(8)
-    if len(worst):
-        show = pd.DataFrame({
-            "Game": worst["game_id"].values,
-            "Move number": worst["move_number"].values,
-            "Move played": worst["move"].values,
-            "Seconds left": worst["clock_before"].round(0).astype(int).values,
-            "Pawns of advantage lost": (worst["eval_drop"] / 100).round(1).values,
-        })
+    show = con.execute("""
+        SELECT game_id                                   AS Game,
+               move_number                               AS "Move number",
+               move                                      AS "Move played",
+               CAST(ROUND(clock_before) AS INTEGER)      AS "Seconds left",
+               ROUND(eval_drop / 100.0, 1)               AS "Pawns of advantage lost"
+        FROM moves
+        WHERE who = 'Player' AND is_blunder = 1
+        ORDER BY eval_drop DESC
+        LIMIT 8
+    """).df()
+    if len(show):
         st.dataframe(show, hide_index=True, use_container_width=True,
                      column_config={"Game": st.column_config.LinkColumn("Game", display_text="Open on Chess.com")})
         st.caption("Look at the **Seconds left** column. Mistakes with only a few seconds left were probably "
@@ -222,8 +255,12 @@ if "df" in st.session_state:
 
     # ---------- 4. Thinking time ----------
     st.markdown("### 4. Does the player speed up when time is short?")
-    think = me.groupby("TimeLeft")["time_spent"].median().reindex(ORDER).dropna().reset_index()
-    think.columns = ["TimeLeft", "Seconds"]
+    think = con.execute(f"""
+        SELECT {BUCKET} AS TimeLeft, MEDIAN(time_spent) AS Seconds
+        FROM moves
+        WHERE who = 'Player'
+        GROUP BY 1
+    """).df()
     bars = (alt.Chart(think).mark_bar().encode(
                 x=alt.X("TimeLeft:N", sort=ORDER, title="Time left on the clock before the move"),
                 y=alt.Y("Seconds:Q", title="Typical seconds spent on one move"))
@@ -235,9 +272,16 @@ if "df" in st.session_state:
     # ---------- More details ----------
     with st.expander("More details (for the curious)"):
         st.markdown("**Big mistakes by stage of the game (% of moves)**")
-        df["Phase"] = pd.cut(df["move_number"], [5, 15, 30, 500],
-                             labels=["Opening (moves 6-15)", "Middlegame (16-30)", "Endgame (31+)"])
-        ph = df.groupby(["Phase", "Who"], observed=True)["is_blunder"].mean().mul(100).unstack()
+        ph = con.execute("""
+            SELECT CASE WHEN move_number <= 15 THEN 'Opening (moves 6-15)'
+                        WHEN move_number <= 30 THEN 'Middlegame (16-30)'
+                        ELSE 'Endgame (31+)' END      AS Phase,
+                   player                             AS Who,
+                   ROUND(100.0 * AVG(is_blunder), 2)  AS Rate
+            FROM moves
+            GROUP BY 1, 2
+        """).df().pivot(index="Phase", columns="Who", values="Rate")
+        ph = ph.reindex(["Opening (moves 6-15)", "Middlegame (16-30)", "Endgame (31+)"])
         st.bar_chart(ph)
         st.caption("Shows whether mistakes cluster late in games, which is when clocks run low.")
 

@@ -4,3 +4,4 @@ pandas
 numpy
 python-chess
 statsmodels
+duckdb
