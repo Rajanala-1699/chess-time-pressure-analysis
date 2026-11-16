@@ -1,0 +1,6 @@
+stockfish-windows-x86-64-
+universal/
+*.pgn
+*.csv
+*.json
+__pycache__/
